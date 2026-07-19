@@ -123,7 +123,7 @@ def train():
 
     # ── Find Phase 1 outputs in Kaggle input directory ───────────
     try:
-        tokenizer_path  = glob.glob("/kaggle/input/*/minillama/data/tokenizer.json")[0]
+        tokenizer_path  = glob.glob("/kaggle/input/*/data/tokenizer.json")[0]
         checkpoint_path = glob.glob("/kaggle/input/*/minillama_step_1999.pt")[0]
         print(f"Tokenizer : {tokenizer_path}")
         print(f"Checkpoint: {checkpoint_path}")
