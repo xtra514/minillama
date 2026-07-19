@@ -212,9 +212,10 @@ def train():
                     X, Y = X.to(device), Y.to(device)
 
                     with ctx:
-                        # Pass Y as targets so the model computes loss internally
-                        # Note: model.forward() handles the cross_entropy but does NOT
-                        # respect ignore_index=-100, so we compute loss ourselves here.
+                        # We compute loss ourselves (with ignore_index=-100) rather than
+                        # using the model's internal loss, to ensure prompt tokens are masked.
+                        # Note: PyTorch cross_entropy defaults to ignore_index=-100, so this
+                        # correctly skips all prompt and padding tokens.
                         logits, _ = model(X)
                         shift_logits = logits[:, :-1, :].contiguous()
                         shift_labels = Y[:, 1:].contiguous()
