@@ -73,8 +73,18 @@ def train():
     weight_decay = 0.05
     grad_clip = 1.0
     
+    import glob
+    
     # 1. Load Tokenizer
-    tokenizer = PreTrainedTokenizerFast(tokenizer_file="minillama/data/tokenizer.json")
+    # Auto-detect from Kaggle's /kaggle/input/ directory
+    try:
+        tokenizer_path = glob.glob("/kaggle/input/*/minillama/data/tokenizer.json")[0]
+        checkpoint_path = glob.glob("/kaggle/input/*/minillama_step_1999.pt")[0]
+    except IndexError:
+        print("Could not find Phase 1 output! Did you click '+ Add Input' and attach your previous Notebook output?")
+        return
+
+    tokenizer = PreTrainedTokenizerFast(tokenizer_file=tokenizer_path)
     
     # 2. Load Dataset
     print("Loading TinyStoriesInstruct...")
@@ -91,7 +101,7 @@ def train():
     model = MiniLlama(config)
     
     # We load the weights from Phase 1
-    state_dict = torch.load("minillama_step_1999.pt", map_location='cpu')
+    state_dict = torch.load(checkpoint_path, map_location='cpu', weights_only=True)
     model.load_state_dict({k.replace('module.', ''): v for k, v in state_dict.items()})
     model.to(device)
     
