@@ -83,16 +83,19 @@ def generate_sample(model, tokenizer, device, prompt_text="A little rabbit was h
     x = torch.tensor([input_ids], dtype=torch.long).to(device)
 
     eos_id = tokenizer.eos_token_id or 2
+    min_new_tokens = 30  # don't allow EOS before this many tokens are generated
+    generated = 0
 
-    for _ in range(150):
-        # BUG FIX #2: model.forward() signature is forward(input_ids, targets=None).
-        # Always pass only one argument during inference.
+    for _ in range(200):
         logits, _ = model(x)
         logits = logits[:, -1, :]  # last token only
-        # Temperature sampling
+        # Ban EOS until min_new_tokens are generated
+        if generated < min_new_tokens:
+            logits[:, eos_id] = float('-inf')
         probs = torch.nn.functional.softmax(logits / 0.8, dim=-1)
         next_token = torch.multinomial(probs, num_samples=1)
         x = torch.cat((x, next_token), dim=1)
+        generated += 1
         if next_token.item() == eos_id:
             break
 
