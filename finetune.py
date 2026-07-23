@@ -122,19 +122,19 @@ def train():
     eval_iters                = 50
 
     # ── Load tokenizer and checkpoint from cloned repo ──────────
-    import os, zipfile
+    import os, shutil
 
     repo_dir        = os.path.join(os.getcwd(), "minillama")
     tokenizer_path  = os.path.join(repo_dir, "tokenizer.json")
     checkpoint_zip  = os.path.join(repo_dir, "minillama_step_1999.zip")
     checkpoint_path = os.path.join(os.getcwd(), "minillama_step_1999.pt")
 
-    # Unzip checkpoint if not already extracted
+    # The zip IS the PyTorch model (PyTorch saves .pt as internal zip format).
+    # Just copy it with the .pt extension — torch.load reads it natively.
     if not os.path.exists(checkpoint_path):
-        print(f"Extracting checkpoint from {checkpoint_zip}...")
-        with zipfile.ZipFile(checkpoint_zip, 'r') as zf:
-            zf.extractall(os.getcwd())
-        print("Extracted.")
+        print(f"Copying checkpoint zip as .pt file...")
+        shutil.copy2(checkpoint_zip, checkpoint_path)
+        print("Done.")
 
     print(f"Tokenizer : {tokenizer_path}")
     print(f"Checkpoint: {checkpoint_path}")
@@ -144,6 +144,7 @@ def train():
         return
 
     tokenizer = PreTrainedTokenizerFast(tokenizer_file=tokenizer_path)
+
 
     # ── Dataset ──────────────────────────────────────────────────
     print("Loading TinyStoriesInstruct...")
