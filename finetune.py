@@ -121,15 +121,26 @@ def train():
     eval_interval             = 100
     eval_iters                = 50
 
-    # ── Find Phase 1 outputs in Kaggle input directory ───────────
-    try:
-        tokenizer_path  = glob.glob("/kaggle/input/*/data/tokenizer.json")[0]
-        checkpoint_path = glob.glob("/kaggle/input/*/minillama_step_1999.pt")[0]
-        print(f"Tokenizer : {tokenizer_path}")
-        print(f"Checkpoint: {checkpoint_path}")
-    except IndexError:
-        print("Could not find Phase 1 output!")
-        print("Click '+ Add Input', go to Your Work -> Notebooks, and add your Phase 1 notebook.")
+    # ── Load tokenizer and checkpoint from cloned repo ──────────
+    import os, zipfile
+
+    repo_dir        = os.path.join(os.getcwd(), "minillama")
+    tokenizer_path  = os.path.join(repo_dir, "tokenizer.json")
+    checkpoint_zip  = os.path.join(repo_dir, "minillama_step_1999.zip")
+    checkpoint_path = os.path.join(os.getcwd(), "minillama_step_1999.pt")
+
+    # Unzip checkpoint if not already extracted
+    if not os.path.exists(checkpoint_path):
+        print(f"Extracting checkpoint from {checkpoint_zip}...")
+        with zipfile.ZipFile(checkpoint_zip, 'r') as zf:
+            zf.extractall(os.getcwd())
+        print("Extracted.")
+
+    print(f"Tokenizer : {tokenizer_path}")
+    print(f"Checkpoint: {checkpoint_path}")
+
+    if not os.path.exists(tokenizer_path) or not os.path.exists(checkpoint_path):
+        print("ERROR: Could not find tokenizer or checkpoint in cloned repo!")
         return
 
     tokenizer = PreTrainedTokenizerFast(tokenizer_file=tokenizer_path)
