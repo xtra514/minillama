@@ -13,9 +13,12 @@ from tokenizers.processors import TemplateProcessing
 from tokenizers.decoders import ByteLevel as ByteLevelDecoder
 from datasets import load_dataset
 
+import os
+
 VOCAB_SIZE  = 32000
-SAVE_PATH   = "data/tokenizer_32k.json"
-TRAIN_SAMPLES = 200_000   # subset of OpenWebText to train tokenizer on
+_REPO_ROOT  = os.path.dirname(os.path.abspath(__file__))
+SAVE_PATH   = os.path.join(_REPO_ROOT, "data", "tokenizer_32k.json")
+TRAIN_SAMPLES = 200_000
 
 def main():
     os.makedirs("data", exist_ok=True)

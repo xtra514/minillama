@@ -17,7 +17,8 @@ from minillama.model.transformer import MiniLlama
 from minillama.utils import LRScheduler
 from minillama.config import CONFIG_100M
 
-# ── Hyperparameters ──────────────────────────────────────────────────────────
+import os
+_REPO_ROOT      = os.path.dirname(os.path.abspath(__file__))
 BATCH_SIZE      = 8
 GRAD_ACCUM      = 4
 MAX_LENGTH      = 1024
@@ -28,8 +29,8 @@ WEIGHT_DECAY    = 0.05
 GRAD_CLIP       = 1.0
 EVAL_INTERVAL   = 200
 EVAL_ITERS      = 30
-TOKENIZER_PATH  = "minillama/data/tokenizer_32k.json"
-CHECKPOINT_GLOB = "minillama_125m_step_*.pt"
+TOKENIZER_PATH  = os.path.join(_REPO_ROOT, "data", "tokenizer_32k.json")
+CHECKPOINT_GLOB = os.path.join(_REPO_ROOT, "minillama_125m_step_*.pt")
 
 INSTRUCTION_PREFIX = "### Instruction:\n"
 RESPONSE_PREFIX    = "\n### Response:\n"

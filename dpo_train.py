@@ -31,6 +31,7 @@ from minillama.utils import LRScheduler
 from minillama.config import CONFIG_100M
 
 # ── Config ───────────────────────────────────────────────────────────────────
+_REPO_ROOT          = os.path.dirname(os.path.abspath(__file__))
 BATCH_SIZE          = 4
 GRAD_ACCUM          = 4
 MAX_LENGTH          = 512
@@ -39,9 +40,9 @@ BETA                = 0.1        # DPO temperature — controls how strongly to 
 MAX_STEPS           = 1_000
 WARMUP_STEPS        = 50
 EVAL_INTERVAL       = 100
-TOKENIZER_PATH      = "minillama/data/tokenizer_32k.json"
-CHAT_CKPT_GLOB      = "minillama_125m_chat_step_*.pt"
-PREF_DATA_PATH      = "dpo_preferences.json"   # cached preference pairs
+TOKENIZER_PATH      = os.path.join(_REPO_ROOT, "data", "tokenizer_32k.json")
+CHAT_CKPT_GLOB      = os.path.join(_REPO_ROOT, "minillama_125m_chat_step_*.pt")
+PREF_DATA_PATH      = os.path.join(_REPO_ROOT, "dpo_preferences.json")
 NUM_JUDGE_SAMPLES   = 500        # how many preference pairs to generate
 
 MIMO_API_URL        = "http://liiwerwp3f3px714nj2yozh0.161.118.160.111.sslip.io/v1/chat/completions"

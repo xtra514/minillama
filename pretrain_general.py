@@ -64,8 +64,9 @@ def hf_pull_latest(hf_repo, hf_token):
         return None
 
 # ── Hyperparameters ─────────────────────────────────────────────────────────
+_REPO_ROOT          = os.path.dirname(os.path.abspath(__file__))
 BATCH_SIZE          = 16
-GRAD_ACCUM          = 8          # effective batch = 128 sequences = ~131K tokens
+GRAD_ACCUM          = 8
 MAX_LENGTH          = 1024
 LEARNING_RATE       = 6e-4
 MIN_LR              = 6e-5
@@ -76,8 +77,8 @@ GRAD_CLIP           = 1.0
 EVAL_INTERVAL       = 500
 EVAL_ITERS          = 50
 SAVE_INTERVAL       = 1_000
-CHECKPOINT_PREFIX   = "minillama_125m_step"
-TOKENIZER_PATH      = "minillama/data/tokenizer_32k.json"
+CHECKPOINT_PREFIX   = os.path.join(_REPO_ROOT, "minillama_125m_step")
+TOKENIZER_PATH      = os.path.join(_REPO_ROOT, "data", "tokenizer_32k.json")
 
 # ── Streaming Dataset ────────────────────────────────────────────────────────
 
