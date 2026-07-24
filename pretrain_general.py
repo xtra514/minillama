@@ -2,9 +2,13 @@
 pretrain_general.py
 Phase 1: Pretrain MiniLlama-125M on OpenWebText.
 
-Kaggle usage:
-    python -m minillama.pretrain_general
-    python -m minillama.pretrain_general --resume  # resume from last checkpoint
+Kaggle usage (fresh start):
+    python -m minillama.pretrain_general --hf_repo YOUR_HF_USERNAME/minillama-125m
+
+Kaggle usage (resume — works across ANY account/session):
+    python -m minillama.pretrain_general --resume --hf_repo YOUR_HF_USERNAME/minillama-125m
+
+Requires HF_TOKEN env var set (add as Kaggle secret).
 """
 import torch
 import torch.nn as nn
@@ -18,6 +22,46 @@ from tokenizers import Tokenizer
 from minillama.model.transformer import MiniLlama
 from minillama.utils import LRScheduler, apply_weight_init
 from minillama.config import CONFIG_100M
+
+# ── HuggingFace Hub helpers ──────────────────────────────────────────────────
+
+def hf_push(local_path, hf_repo, hf_token):
+    """Upload a checkpoint file to HuggingFace Hub."""
+    try:
+        from huggingface_hub import HfApi
+        api = HfApi(token=hf_token)
+        api.create_repo(hf_repo, exist_ok=True, private=False)
+        api.upload_file(
+            path_or_fileobj=local_path,
+            path_in_repo=os.path.basename(local_path),
+            repo_id=hf_repo,
+        )
+        print(f"  ✓ Uploaded {os.path.basename(local_path)} → hf.co/{hf_repo}")
+    except Exception as e:
+        print(f"  ⚠ HF upload failed (non-fatal): {e}")
+
+
+def hf_pull_latest(hf_repo, hf_token):
+    """Download the latest checkpoint from HuggingFace Hub. Returns local path."""
+    try:
+        from huggingface_hub import HfApi, hf_hub_download
+        api = HfApi(token=hf_token)
+        files = api.list_repo_files(hf_repo)
+        ckpts = sorted(
+            [f for f in files if f.startswith(CHECKPOINT_PREFIX) and f.endswith(".pt")],
+            key=lambda f: int(f.replace(CHECKPOINT_PREFIX + "_", "").replace(".pt", ""))
+        )
+        if not ckpts:
+            print("  No checkpoints found on HF Hub.")
+            return None
+        latest = ckpts[-1]
+        print(f"  Downloading {latest} from hf.co/{hf_repo}...")
+        local = hf_hub_download(repo_id=hf_repo, filename=latest, token=hf_token)
+        print(f"  Downloaded to {local}")
+        return local
+    except Exception as e:
+        print(f"  ⚠ HF download failed: {e}")
+        return None
 
 # ── Hyperparameters ─────────────────────────────────────────────────────────
 BATCH_SIZE          = 16
@@ -91,7 +135,7 @@ def find_latest_checkpoint():
     return ckpts[-1] if ckpts else None
 
 
-def save_checkpoint(model, optimizer, step):
+def save_checkpoint(model, optimizer, step, hf_repo=None, hf_token=None):
     raw = model.module if hasattr(model, "module") else model
     path = f"{CHECKPOINT_PREFIX}_{step}.pt"
     torch.save({
@@ -100,6 +144,9 @@ def save_checkpoint(model, optimizer, step):
         "optimizer_state_dict": optimizer.state_dict(),
     }, path)
     print(f"  ✓ Saved checkpoint: {path}")
+    # Auto-push to HuggingFace Hub if configured
+    if hf_repo and hf_token:
+        hf_push(path, hf_repo, hf_token)
 
 
 # ── Generation preview ───────────────────────────────────────────────────────
@@ -162,9 +209,19 @@ def train(resume=False):
         lr=LEARNING_RATE, betas=(0.9, 0.95), fused=(device_type == "cuda")
     )
 
+    hf_token = os.environ.get("HF_TOKEN", None)
+    hf_repo  = args.hf_repo if args.hf_repo else None
+    if hf_repo:
+        print(f"HuggingFace Hub: hf.co/{hf_repo} (token={'set' if hf_token else 'NOT SET'})")
+
     start_step = 0
     if resume:
+        # 1. Try local checkpoint first
         ckpt_path = find_latest_checkpoint()
+        # 2. If not found locally, pull from HF Hub
+        if not ckpt_path and hf_repo and hf_token:
+            print("No local checkpoint found — pulling from HuggingFace Hub...")
+            ckpt_path = hf_pull_latest(hf_repo, hf_token)
         if ckpt_path:
             print(f"Resuming from {ckpt_path}...")
             ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
@@ -173,7 +230,7 @@ def train(resume=False):
             start_step = ckpt["step"] + 1
             print(f"Resumed at step {start_step}")
         else:
-            print("No checkpoint found — starting fresh.")
+            print("No checkpoint found anywhere — starting fresh.")
 
     model.to(device)
     if torch.cuda.device_count() > 1:
@@ -253,15 +310,16 @@ def train(resume=False):
 
         # ── Checkpoint ────────────────────────────────────────────
         if step > 0 and step % SAVE_INTERVAL == 0:
-            save_checkpoint(model, optimizer, step)
+            save_checkpoint(model, optimizer, step, hf_repo, hf_token)
 
     # Final save
-    save_checkpoint(model, optimizer, MAX_STEPS - 1)
+    save_checkpoint(model, optimizer, MAX_STEPS - 1, hf_repo, hf_token)
     print("Pretraining complete!")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--resume", action="store_true", help="Resume from latest checkpoint")
+    parser.add_argument("--resume",   action="store_true", help="Resume from latest checkpoint (local or HF Hub)")
+    parser.add_argument("--hf_repo",  default=None,        help="HuggingFace repo to push/pull checkpoints, e.g. username/minillama-125m")
     args = parser.parse_args()
-    train(resume=args.resume)
+    train(resume=args.resume, args=args)
