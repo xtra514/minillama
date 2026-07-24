@@ -45,7 +45,7 @@ PREF_DATA_PATH      = "dpo_preferences.json"   # cached preference pairs
 NUM_JUDGE_SAMPLES   = 500        # how many preference pairs to generate
 
 MIMO_API_URL        = "http://liiwerwp3f3px714nj2yozh0.161.118.160.111.sslip.io/v1/chat/completions"
-JUDGE_MODEL         = "llama-3.3-70b-instruct:free"
+JUDGE_MODEL         = "mimo-v2.5-free"
 
 INSTRUCTION_PREFIX  = "### Instruction:\n"
 RESPONSE_PREFIX     = "\n### Response:\n"
