@@ -123,8 +123,8 @@ def build_loaders(tokenizer):
     # In practice we just use a separate iterator that starts from the same data.
     val_ds   = OpenWebTextDataset(tokenizer, MAX_LENGTH, split="train")
 
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, num_workers=2, pin_memory=True)
-    val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, num_workers=1)
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, num_workers=0, pin_memory=True)
+    val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, num_workers=0)
     return train_loader, val_loader
 
 
