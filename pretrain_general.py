@@ -175,7 +175,7 @@ def generate_preview(model, tokenizer, device, prompt="Hello! My name is"):
 
 # ── Main training loop ───────────────────────────────────────────────────────
 
-def train(resume=False):
+def train(resume=False, args=None):
     device      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     device_type = "cuda" if device.type == "cuda" else "cpu"
     print(f"Device: {device}")
@@ -320,7 +320,7 @@ def train(resume=False):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--resume",   action="store_true", help="Resume from latest checkpoint (local or HF Hub)")
-    parser.add_argument("--hf_repo",  default=None,        help="HuggingFace repo to push/pull checkpoints, e.g. username/minillama-125m")
+    parser.add_argument("--resume",  action="store_true", help="Resume from latest checkpoint (local or HF Hub)")
+    parser.add_argument("--hf_repo", default=None,        help="HuggingFace repo, e.g. username/minillama-125m")
     args = parser.parse_args()
     train(resume=args.resume, args=args)
