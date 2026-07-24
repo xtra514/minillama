@@ -65,8 +65,8 @@ def hf_pull_latest(hf_repo, hf_token):
 
 # ── Hyperparameters ─────────────────────────────────────────────────────────
 _REPO_ROOT          = os.path.dirname(os.path.abspath(__file__))
-BATCH_SIZE          = 16
-GRAD_ACCUM          = 8
+BATCH_SIZE          = 4    # reduced for T4 VRAM (effective batch = 4×32 = 128)
+GRAD_ACCUM          = 32
 MAX_LENGTH          = 1024
 LEARNING_RATE       = 6e-4
 MIN_LR              = 6e-5
