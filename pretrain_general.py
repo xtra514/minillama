@@ -265,11 +265,9 @@ def train(resume=False, args=None):
                         X, Y = next(val_iter)
                     X, Y = X.to(device), Y.to(device)
                     with ctx:
-                        logits, _ = model(X)
-                        loss = nn.functional.cross_entropy(
-                            logits[:, :-1].reshape(-1, vocab_size),
-                            Y[:, 1:].reshape(-1)
-                        )
+                        _, loss = model(X, Y)          # loss computed inside model per-GPU
+                        if loss.dim() > 0:
+                            loss = loss.mean()         # average across DataParallel GPUs
                     val_loss += loss.item()
                 val_loss /= EVAL_ITERS
             print(f"Step {step} | val loss {val_loss:.4f}")
@@ -290,11 +288,10 @@ def train(resume=False, args=None):
             X, Y = X.to(device), Y.to(device)
 
             with ctx:
-                logits, _ = model(X)
-                loss = nn.functional.cross_entropy(
-                    logits[:, :-1].reshape(-1, vocab_size),
-                    Y[:, 1:].reshape(-1)
-                ) / GRAD_ACCUM
+                _, loss = model(X, Y)              # loss computed inside model per-GPU
+                if loss.dim() > 0:
+                    loss = loss.mean()             # average across DataParallel GPUs
+                loss = loss / GRAD_ACCUM
 
             scaler.scale(loss).backward()
             accum_loss += loss.item() * GRAD_ACCUM
