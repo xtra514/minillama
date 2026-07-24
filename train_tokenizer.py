@@ -21,10 +21,10 @@ SAVE_PATH   = os.path.join(_REPO_ROOT, "data", "tokenizer_32k.json")
 TRAIN_SAMPLES = 200_000
 
 def main():
-    os.makedirs("data", exist_ok=True)
+    os.makedirs(os.path.join(_REPO_ROOT, "data"), exist_ok=True)
 
     print(f"Loading {TRAIN_SAMPLES} OpenWebText samples for tokenizer training...")
-    ds = load_dataset("openwebtext", split="train", streaming=True, trust_remote_code=True)
+    ds = load_dataset("openwebtext", split="train", streaming=True)
 
     def text_iterator():
         for i, sample in enumerate(ds):
