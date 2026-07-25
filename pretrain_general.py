@@ -229,6 +229,11 @@ def train(resume=False, args=None):
             ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
             model.load_state_dict(ckpt["model_state_dict"])
             optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            # Move optimizer states to GPU (loaded on CPU by default)
+            for state in optimizer.state.values():
+                for k, v in state.items():
+                    if isinstance(v, torch.Tensor):
+                        state[k] = v.to(device)
             start_step = ckpt["step"] + 1
             print(f"Resumed at step {start_step}")
         else:
