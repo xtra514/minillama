@@ -47,9 +47,10 @@ def hf_pull_latest(hf_repo, hf_token):
         from huggingface_hub import HfApi, hf_hub_download
         api = HfApi(token=hf_token)
         files = api.list_repo_files(hf_repo)
+        prefix_basename = os.path.basename(CHECKPOINT_PREFIX)   # e.g. "minillama_125m_step"
         ckpts = sorted(
-            [f for f in files if f.startswith(CHECKPOINT_PREFIX) and f.endswith(".pt")],
-            key=lambda f: int(f.replace(CHECKPOINT_PREFIX + "_", "").replace(".pt", ""))
+            [f for f in files if f.startswith(prefix_basename) and f.endswith(".pt")],
+            key=lambda f: int(f.replace(prefix_basename + "_", "").replace(".pt", ""))
         )
         if not ckpts:
             print("  No checkpoints found on HF Hub.")
