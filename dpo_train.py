@@ -53,7 +53,7 @@ SAVE_INTERVAL  = 500
 
 # ── API ───────────────────────────────────────────────────────────────────────
 MIMO_API_URL  = "http://liiwerwp3f3px714nj2yozh0.161.118.160.111.sslip.io/v1/chat/completions"
-JUDGE_MODEL   = "mimo-v2.5-free"
+JUDGE_MODEL   = "mimo-swarm"   # multi-agent orchestration = best quality judgments
 
 SFT_PREFIX = "minillama_125m_sft_step"
 DPO_PREFIX = "minillama_125m_dpo_step"
@@ -150,30 +150,47 @@ def mimo_judge_three(instruction, resp_a, resp_b, resp_c, api_key, retries=3):
     }
     for attempt in range(retries):
         try:
-            r    = requests.post(MIMO_API_URL, headers=headers,
-                                 json=payload, timeout=60)
+            r    = requests.post(
+                MIMO_API_URL,
+                headers=headers,
+                json=payload, timeout=90)   # swarm needs more time
             r.raise_for_status()
             text = r.json()["choices"][0]["message"]["content"].strip()
+            upper = text.upper()
 
             best  = None
             worst = None
+
+            import re
+            upper = text.upper()
+
+            # Pattern 1: BEST: X / WORST: Y lines
             for line in text.splitlines():
-                l = line.strip().upper()
-                if l.startswith("BEST:") and not best:
-                    c = l.replace("BEST:", "").strip()[:1]
-                    if c in ("A", "B", "C"):
-                        best = c
-                if l.startswith("WORST:") and not worst:
-                    c = l.replace("WORST:", "").strip()[:1]
-                    if c in ("A", "B", "C"):
-                        worst = c
+                l = line.strip().upper().lstrip("*").strip()
+                for pfx, key in [("BEST:", "best"), ("WORST:", "worst")]:
+                    if l.startswith(pfx):
+                        c = l.replace(pfx, "").strip().lstrip("*").strip()[:1]
+                        if c in ("A", "B", "C"):
+                            if key == "best"  and not best:  best  = c
+                            if key == "worst" and not worst: worst = c
+
+            # Pattern 2: mimo-swarm "Final Answer: X" or "Final Synthesis" format
+            if not best:
+                m = re.search(r"FINAL\s+ANSWER[:\s*]+([ABC])", upper)
+                if m: best = m.group(1)
+            if not worst:
+                m = re.search(r"WORST[:\s*]+([ABC])", upper)
+                if m: worst = m.group(1)
+
+            # Pattern 3: last resort — first and last letter mentions
+            if not (best and worst):
+                letters = re.findall(r"\b([ABC])\b", upper)
+                if len(letters) >= 2:
+                    best  = letters[0]
+                    worst = [l for l in reversed(letters) if l != best][0] if any(l != best for l in letters) else None
 
             if best and worst and best != worst:
                 return best, worst
-            # fallback: try single-letter parse
-            letters = [w for w in text.split() if w in ("A", "B", "C")]
-            if len(letters) >= 2:
-                return letters[0], letters[-1]
 
         except Exception as e:
             print(f"  ⚠ Judge error (attempt {attempt+1}): {e}")
