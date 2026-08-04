@@ -1,26 +1,25 @@
 """
-dpo_train.py  —  Phase 3: RLAIF + DPO with Mimo as judge (FULL SCALE)
+dpo_train.py  —  Phase 3: DPO with Anthropic HH-RLHF Dataset
+
+Uses the same dataset as Llama 2, Vicuna, Mistral, Zephyr etc.
+169K human-labeled preference pairs — no API judge needed.
 
 Pipeline:
-  1. Load SFT model from HuggingFace
-  2. Generate 3 responses per instruction (temp 0.6 / 0.9 / 1.2)
-  3. Mimo judges all 3 and picks BEST and WORST
-  4. Build (instruction, best, worst) preference triplets
-  5. Train DPO loss — model strongly prefers best over worst
-  6. Save checkpoints to HuggingFace
-
-Scale: 1000 pairs × 2000 DPO steps = maximum alignment signal.
+  1. Load Anthropic/hh-rlhf (human chosen vs rejected pairs)
+  2. Parse into (instruction, chosen, rejected) format
+  3. Train with DPO loss against frozen SFT reference model
+  4. Save checkpoints to HuggingFace
 
 Kaggle usage:
     import minillama.dpo_train as dt
     dt.train(args=Args())
 
-Requires: HF_TOKEN, MIMO_API_KEY as Kaggle secrets.
+Requires: HF_TOKEN as Kaggle secret.
 """
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import os, json, time, glob, requests, random
+import os, json, re, random
 from contextlib import nullcontext
 from torch.utils.data import Dataset, DataLoader
 from tokenizers import Tokenizer
@@ -30,30 +29,19 @@ from minillama.utils import LRScheduler
 from minillama.config import CONFIG_100M
 
 # ── Config ────────────────────────────────────────────────────────────────────
-_REPO_ROOT        = os.path.dirname(os.path.abspath(__file__))
-TOKENIZER_PATH    = os.path.join(_REPO_ROOT, "data", "tokenizer_32k.json")
-PREF_DATA_PATH    = os.path.join(_REPO_ROOT, "dpo_preferences.json")
-PREF_DATA_HF_FILE = "dpo_preferences.json"
+_REPO_ROOT     = os.path.dirname(os.path.abspath(__file__))
+TOKENIZER_PATH = os.path.join(_REPO_ROOT, "data", "tokenizer_32k.json")
 
-# ── Scale knobs (FULL) ────────────────────────────────────────────────────────
-NUM_JUDGE_SAMPLES = 1000    # preference pairs — unlimited API so go big
-GEN_TEMPERATURES  = [0.6, 0.9, 1.2]   # 3 candidates per prompt
-GEN_MAX_TOKENS    = 200     # per candidate response
-MAX_LENGTH        = 512     # DPO training sequence length
-
-# ── DPO training ──────────────────────────────────────────────────────────────
-BATCH_SIZE     = 1
+NUM_PAIRS      = 10_000    # subset of HH-RLHF to use (169K available)
+MAX_LENGTH     = 512       # training sequence length
+BATCH_SIZE     = 2
 GRAD_ACCUM     = 8
-LEARNING_RATE  = 5e-7       # tiny — preserve SFT knowledge
-BETA           = 0.1        # DPO temperature
+LEARNING_RATE  = 5e-7      # tiny — preserve SFT knowledge
+BETA           = 0.1       # DPO temperature
 MAX_STEPS      = 2_000
 WARMUP_STEPS   = 100
 EVAL_INTERVAL  = 200
 SAVE_INTERVAL  = 500
-
-# ── API ───────────────────────────────────────────────────────────────────────
-MIMO_API_URL  = "http://liiwerwp3f3px714nj2yozh0.161.118.160.111.sslip.io/v1/chat/completions"
-JUDGE_MODEL   = "mimo-swarm"   # multi-agent orchestration = best quality judgments
 
 SFT_PREFIX = "minillama_125m_sft_step"
 DPO_PREFIX = "minillama_125m_dpo_step"
@@ -76,20 +64,6 @@ def hf_push(local_path, hf_repo, hf_token):
         print(f"  ⚠ HF upload failed: {e}")
 
 
-def hf_pull_file(hf_repo, hf_token, filename):
-    try:
-        from huggingface_hub import hf_hub_download, HfApi
-        api   = HfApi(token=hf_token)
-        files = list(api.list_repo_files(hf_repo))
-        if filename not in files:
-            return None
-        return hf_hub_download(repo_id=hf_repo, filename=filename,
-                                token=hf_token)
-    except Exception as e:
-        print(f"  ⚠ HF download ({filename}): {e}")
-        return None
-
-
 def hf_pull_latest(hf_repo, hf_token, prefix):
     try:
         from huggingface_hub import HfApi, hf_hub_download
@@ -106,233 +80,86 @@ def hf_pull_latest(hf_repo, hf_token, prefix):
         print(f"  Downloading {target} from HF Hub...")
         local  = hf_hub_download(repo_id=hf_repo, filename=target,
                                   token=hf_token)
-        print(f"  Downloaded to {local}")
         return local, step
     except Exception as e:
-        print(f"  ⚠ HF pull ({prefix}): {e}")
+        print(f"  ⚠ HF pull failed: {e}")
         return None, None
 
-# ── Mimo AI Judge — multi-criteria ───────────────────────────────────────────
+# ── HH-RLHF Parser ───────────────────────────────────────────────────────────
 
-JUDGE_SYSTEM = (
-    "You are an expert AI evaluator. Score each response on:\n"
-    "1. Helpfulness — does it actually answer the instruction?\n"
-    "2. Accuracy    — is the information correct?\n"
-    "3. Clarity     — is it easy to understand?\n"
-    "4. Completeness — does it cover all aspects?\n"
-    "Be strict and objective."
-)
-
-def mimo_judge_three(instruction, resp_a, resp_b, resp_c, api_key, retries=3):
+def parse_hh_pair(chosen_text, rejected_text):
     """
-    Ask Mimo to rank 3 responses and return (best_letter, worst_letter).
-    Returns e.g. ('A', 'C') meaning A is best, C is worst.
+    HH-RLHF format:
+      '\n\nHuman: <instruction>\n\nAssistant: <response>'
+
+    Returns (instruction, chosen_response, rejected_response) or None.
     """
-    prompt = (
-        f"Instruction: {instruction}\n\n"
-        f"Response A:\n{resp_a}\n\n"
-        f"Response B:\n{resp_b}\n\n"
-        f"Response C:\n{resp_c}\n\n"
-        "Rank these responses from best to worst based on helpfulness, "
-        "accuracy, clarity, and completeness.\n"
-        "Reply in EXACTLY this format:\n"
-        "BEST: X\nWORST: Y\n"
-        "where X and Y are A, B, or C."
-    )
-    headers = {"Authorization": f"Bearer {api_key}",
-               "Content-Type":  "application/json"}
-    payload = {
-        "model":       JUDGE_MODEL,
-        "messages":    [{"role": "system", "content": JUDGE_SYSTEM},
-                        {"role": "user",   "content": prompt}],
-        "temperature": 0.1,
-        "stream":      False,
-    }
-    for attempt in range(retries):
-        try:
-            r    = requests.post(
-                MIMO_API_URL,
-                headers=headers,
-                json=payload, timeout=90)   # swarm needs more time
-            r.raise_for_status()
-            text = r.json()["choices"][0]["message"]["content"].strip()
-            upper = text.upper()
+    def extract_last_exchange(text):
+        # Split on Human turns, take last one
+        human_parts = text.split("\n\nHuman: ")
+        if len(human_parts) < 2:
+            return None, None
+        last = human_parts[-1]
+        if "\n\nAssistant: " not in last:
+            return None, None
+        instruction, response = last.split("\n\nAssistant: ", 1)
+        return instruction.strip(), response.strip()
 
-            best  = None
-            worst = None
+    instr_c, resp_c = extract_last_exchange(chosen_text)
+    instr_r, resp_r = extract_last_exchange(rejected_text)
 
-            import re
-            upper = text.upper()
+    if not (instr_c and resp_c and resp_r):
+        return None
 
-            # Pattern 1: BEST: X / WORST: Y lines
-            for line in text.splitlines():
-                l = line.strip().upper().lstrip("*").strip()
-                for pfx, key in [("BEST:", "best"), ("WORST:", "worst")]:
-                    if l.startswith(pfx):
-                        c = l.replace(pfx, "").strip().lstrip("*").strip()[:1]
-                        if c in ("A", "B", "C"):
-                            if key == "best"  and not best:  best  = c
-                            if key == "worst" and not worst: worst = c
+    # Sanity: responses must differ and be non-trivial
+    if resp_c == resp_r or len(resp_c) < 5 or len(resp_r) < 5:
+        return None
 
-            # Pattern 2: mimo-swarm "Final Answer: X" or "Final Synthesis" format
-            if not best:
-                m = re.search(r"FINAL\s+ANSWER[:\s*]+([ABC])", upper)
-                if m: best = m.group(1)
-            if not worst:
-                m = re.search(r"WORST[:\s*]+([ABC])", upper)
-                if m: worst = m.group(1)
+    # Use instruction from chosen (they share the same prompt)
+    return {"instruction": instr_c,
+            "chosen":      resp_c,
+            "rejected":    resp_r}
 
-            # Pattern 3: last resort — first and last letter mentions
-            if not (best and worst):
-                letters = re.findall(r"\b([ABC])\b", upper)
-                if len(letters) >= 2:
-                    best  = letters[0]
-                    worst = [l for l in reversed(letters) if l != best][0] if any(l != best for l in letters) else None
 
-            if best and worst and best != worst:
-                return best, worst
+def load_hh_rlhf(n=10_000, seed=42):
+    """Load and parse Anthropic HH-RLHF preference pairs."""
+    print(f"Loading Anthropic/hh-rlhf (n={n})...")
+    ds = load_dataset("Anthropic/hh-rlhf", split="train")
+    ds = ds.shuffle(seed=seed)
 
-        except Exception as e:
-            print(f"  ⚠ Judge error (attempt {attempt+1}): {e}")
-            time.sleep(2 ** attempt)
-
-    # Default fallback
-    return "A", "C"
-
-# ── Response Generation ───────────────────────────────────────────────────────
-
-@torch.no_grad()
-def generate_response(raw_model, tokenizer, instruction, device,
-                      temperature=0.9, max_tokens=GEN_MAX_TOKENS):
-    raw_model.eval()
-    prompt = INSTRUCTION_PREFIX + instruction + RESPONSE_PREFIX
-    ids    = tokenizer.encode(prompt, add_special_tokens=False).ids
-    x      = torch.tensor([ids], dtype=torch.long, device=device)
-    eos    = tokenizer.token_to_id("</s>") or 2
-
-    out = []
-    for i in range(max_tokens):
-        logits, _ = raw_model(x[:, -CONFIG_100M.max_position_embeddings:])
-        logits     = logits[:, -1, :] / max(temperature, 1e-6)
-        logits[:, 0] = float("-inf")
-        if i < 5:
-            logits[:, eos] = float("-inf")
-        tok = torch.multinomial(F.softmax(logits, dim=-1), 1)
-        x   = torch.cat([x, tok], dim=1)
-        if tok.item() == eos:
-            break
-        out.append(tok.item())
-
-    return tokenizer.decode(out).strip()
-
-# ── Preference Dataset Builder ────────────────────────────────────────────────
-
-def build_preference_dataset(raw_model, tokenizer, device,
-                              api_key, hf_repo, hf_token, n=1000):
-    # Try local cache
-    data = []
-    if os.path.exists(PREF_DATA_PATH):
-        with open(PREF_DATA_PATH) as f:
-            data = json.load(f)
-        print(f"Loaded {len(data)} cached preference pairs.")
-        if len(data) >= n:
-            print("Preference dataset complete (cached).")
-            return data
-
-    # Try HF Hub cache
-    if not data and hf_repo and hf_token:
-        local = hf_pull_file(hf_repo, hf_token, PREF_DATA_HF_FILE)
-        if local:
-            import shutil
-            shutil.copy(local, PREF_DATA_PATH)
-            with open(PREF_DATA_PATH) as f:
-                data = json.load(f)
-            print(f"Downloaded {len(data)} pairs from HF Hub.")
-            if len(data) >= n:
-                return data
-
-    print(f"\nGenerating {n - len(data)} preference pairs "
-          f"({len(GEN_TEMPERATURES)} candidates each, Mimo 3-way judge)...")
-
-    ds = load_dataset("tatsu-lab/alpaca", split="train")
-    ds = ds.shuffle(seed=77).select(range(min(n * 4, len(ds))))
-
+    pairs = []
     for row in ds:
-        if len(data) >= n:
+        if len(pairs) >= n:
             break
+        parsed = parse_hh_pair(row["chosen"], row["rejected"])
+        if parsed:
+            pairs.append(parsed)
 
-        instruction = row["instruction"].strip()
-        if row.get("input", "").strip():
-            instruction += "\n" + row["input"].strip()
-
-        # Generate 3 candidates at different temperatures
-        candidates = []
-        for temp in GEN_TEMPERATURES:
-            r = generate_response(raw_model, tokenizer, instruction,
-                                   device, temperature=temp)
-            candidates.append(r)
-
-        # Skip if too similar
-        unique = set(c.strip()[:50] for c in candidates if c)
-        if len(unique) < 2:
-            continue
-
-        resp_a, resp_b, resp_c = candidates[0], candidates[1], candidates[2]
-
-        # Judge
-        best_letter, worst_letter = mimo_judge_three(
-            instruction, resp_a, resp_b, resp_c, api_key
-        )
-
-        letter_map = {"A": resp_a, "B": resp_b, "C": resp_c}
-        chosen   = letter_map.get(best_letter,  resp_a)
-        rejected = letter_map.get(worst_letter, resp_c)
-
-        if chosen == rejected:
-            continue
-
-        data.append({
-            "instruction": instruction,
-            "chosen":      chosen,
-            "rejected":    rejected,
-            "best":        best_letter,
-            "worst":       worst_letter,
-        })
-
-        if len(data) % 10 == 0:
-            print(f"  [{len(data):4d}/{n}] best={best_letter} | "
-                  f"chosen[:50]={chosen[:50]!r}")
-            with open(PREF_DATA_PATH, "w") as f:
-                json.dump(data, f, indent=2)
-            if hf_repo and hf_token:
-                hf_push(PREF_DATA_PATH, hf_repo, hf_token)
-
-    with open(PREF_DATA_PATH, "w") as f:
-        json.dump(data, f, indent=2)
-    if hf_repo and hf_token:
-        hf_push(PREF_DATA_PATH, hf_repo, hf_token)
-
-    print(f"✓ Preference dataset: {len(data)} pairs saved.")
-    return data
+    print(f"✓ Parsed {len(pairs)} valid preference pairs from HH-RLHF.")
+    return pairs
 
 # ── DPO Dataset ───────────────────────────────────────────────────────────────
 
 class DPODataset(Dataset):
-    def __init__(self, prefs, tokenizer, max_length=512):
-        self.data      = prefs
-        self.tok       = tokenizer
-        self.max_len   = max_length
-        self.eos       = tokenizer.token_to_id("</s>") or 2
-        self.instr_ids = tokenizer.encode(INSTRUCTION_PREFIX,
-                                           add_special_tokens=False).ids
-        self.resp_ids  = tokenizer.encode(RESPONSE_PREFIX,
-                                           add_special_tokens=False).ids
+    def __init__(self, pairs, tokenizer, max_length=512):
+        self.data    = pairs
+        self.tok     = tokenizer
+        self.max_len = max_length
+        self.eos     = tokenizer.token_to_id("</s>") or 2
+        self.instr_p = tokenizer.encode(INSTRUCTION_PREFIX,
+                                         add_special_tokens=False).ids
+        self.resp_p  = tokenizer.encode(RESPONSE_PREFIX,
+                                         add_special_tokens=False).ids
 
-    def _enc(self, instruction, response):
-        p = (self.instr_ids
-             + self.tok.encode(instruction, add_special_tokens=False).ids
-             + self.resp_ids)
-        r = self.tok.encode(response, add_special_tokens=False).ids + [self.eos]
+    def _encode(self, instruction, response):
+        # Truncate instruction to avoid overflow
+        instr_ids = self.tok.encode(instruction,
+                                     add_special_tokens=False).ids[:200]
+        resp_ids  = self.tok.encode(response,
+                                     add_special_tokens=False).ids[:250]
+
+        p      = self.instr_p + instr_ids + self.resp_p
+        r      = resp_ids + [self.eos]
         full   = (p + r)[:self.max_len]
         labels = ([-100] * len(p) + r)[:self.max_len]
         pad    = self.max_len - len(full)
@@ -343,8 +170,8 @@ class DPODataset(Dataset):
 
     def __getitem__(self, i):
         row = self.data[i]
-        ci, cl = self._enc(row["instruction"], row["chosen"])
-        ri, rl = self._enc(row["instruction"], row["rejected"])
+        ci, cl = self._encode(row["instruction"], row["chosen"])
+        ri, rl = self._encode(row["instruction"], row["rejected"])
         return ci, cl, ri, rl
 
 # ── DPO Loss ──────────────────────────────────────────────────────────────────
@@ -356,8 +183,8 @@ def _mean_log_prob(m, ids, labels, vocab_size):
     mask         = shift_labels != -100
     if mask.sum() == 0:
         return torch.tensor(0.0, device=ids.device, requires_grad=m.training)
-    lp   = F.log_softmax(shift_logits, dim=-1)
-    tlp  = lp.gather(1, shift_labels.clamp(min=0).unsqueeze(1)).squeeze(1)
+    lp  = F.log_softmax(shift_logits, dim=-1)
+    tlp = lp.gather(1, shift_labels.clamp(min=0).unsqueeze(1)).squeeze(1)
     return (tlp * mask).sum() / mask.sum()
 
 
@@ -369,8 +196,7 @@ def dpo_loss(policy, ref, c_ids, c_lab, r_ids, r_lab, beta, vocab_size):
     pol_c = _mean_log_prob(policy, c_ids, c_lab, vocab_size)
     pol_r = _mean_log_prob(policy, r_ids, r_lab, vocab_size)
 
-    reward_gap = beta * ((pol_c - ref_c) - (pol_r - ref_r))
-    loss       = -F.logsigmoid(reward_gap)
+    loss = -F.logsigmoid(beta * ((pol_c - ref_c) - (pol_r - ref_r)))
 
     with torch.no_grad():
         acc = ((pol_c - ref_c) > (pol_r - ref_r)).float()
@@ -382,31 +208,6 @@ def dpo_loss(policy, ref, c_ids, c_lab, r_ids, r_lab, beta, vocab_size):
 def train(args=None):
     hf_repo  = args.hf_repo if args and hasattr(args, "hf_repo") else None
     hf_token = os.environ.get("HF_TOKEN", None)
-    api_key  = os.environ.get("MIMO_API_KEY", "")
-
-    if not api_key:
-        print("ERROR: MIMO_API_KEY not set!"); return
-
-    # ── Mimo connectivity ping ────────────────────────────────────────────────
-    print("\n🔌 Pinging Mimo API... ", end="", flush=True)
-    try:
-        _r = requests.post(
-            MIMO_API_URL,
-            headers={"Authorization": f"Bearer {api_key}",
-                     "Content-Type":  "application/json"},
-            json={"model": JUDGE_MODEL,
-                  "messages": [{"role": "user", "content": "Reply with just: OK"}],
-                  "temperature": 0.0, "stream": False},
-            timeout=60,
-        )
-        _r.raise_for_status()
-        _reply = _r.json()["choices"][0]["message"]["content"].strip()
-        print(f"✅ Mimo is live! Response: {_reply!r}")
-    except Exception as _e:
-        print(f"\n❌ Mimo is NOT reachable: {_e}")
-        print("Fix: check MIMO_API_KEY or network, then restart.")
-        return
-    # ─────────────────────────────────────────────────────────────────────────
 
     device      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     device_type = "cuda" if device.type == "cuda" else "cpu"
@@ -419,21 +220,21 @@ def train(args=None):
     config            = CONFIG_100M
     config.vocab_size = vocab_size
 
-    # Load SFT weights
-    print("Loading SFT checkpoint from HF Hub...")
+    # ── Load SFT checkpoint ───────────────────────────────────────────────────
+    print("\nLoading SFT checkpoint from HF Hub...")
     ckpt_path, _ = hf_pull_latest(hf_repo, hf_token, SFT_PREFIX)
     if not ckpt_path:
-        print("ERROR: No SFT checkpoint! Run finetune_chat.py first."); return
+        print("ERROR: No SFT checkpoint found! Run finetune_chat.py first.")
+        return
 
     raw_state = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     state     = raw_state.get("model_state_dict", raw_state)
     state     = {k.replace("module.", ""): v for k, v in state.items()}
 
-    # Policy model
+    # Policy model (trained)
     policy = MiniLlama(config)
     policy.load_state_dict(state, strict=False)
     policy.to(device)
-    raw = policy   # keep reference before DataParallel wrap
 
     # Reference model (frozen)
     ref = MiniLlama(config)
@@ -449,17 +250,14 @@ def train(args=None):
         print(f"Using {torch.cuda.device_count()} GPUs")
         policy = nn.DataParallel(policy)
 
-    # ── Phase 3a: Preference Dataset ─────────────────────────────────────────
-    prefs = build_preference_dataset(
-        raw, tokenizer, device, api_key, hf_repo, hf_token,
-        n=NUM_JUDGE_SAMPLES
-    )
-    random.shuffle(prefs)
+    # ── Load HH-RLHF dataset ─────────────────────────────────────────────────
+    pairs = load_hh_rlhf(n=NUM_PAIRS)
+    random.shuffle(pairs)
 
-    split    = int(0.95 * len(prefs))
-    train_ds = DPODataset(prefs[:split], tokenizer, MAX_LENGTH)
-    val_ds   = DPODataset(prefs[split:], tokenizer, MAX_LENGTH)
-    print(f"\nDPO dataset — Train: {len(train_ds)} | Val: {len(val_ds)}")
+    split    = int(0.95 * len(pairs))
+    train_ds = DPODataset(pairs[:split], tokenizer, MAX_LENGTH)
+    val_ds   = DPODataset(pairs[split:], tokenizer, MAX_LENGTH)
+    print(f"DPO dataset — Train: {len(train_ds)} | Val: {len(val_ds)}")
 
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE,
                               shuffle=True,  drop_last=True,  num_workers=0)
@@ -468,7 +266,7 @@ def train(args=None):
     train_iter = iter(train_loader)
     val_iter   = iter(val_loader)
 
-    # ── Phase 3b: DPO Training ────────────────────────────────────────────────
+    # ── DPO Training ──────────────────────────────────────────────────────────
     optimizer = torch.optim.AdamW(
         policy.parameters(), lr=LEARNING_RATE,
         weight_decay=0.01, betas=(0.9, 0.95)
@@ -483,12 +281,12 @@ def train(args=None):
            if device_type == "cuda" else nullcontext())
 
     print(f"\nStarting DPO — {MAX_STEPS} steps | β={BETA} | "
-          f"{NUM_JUDGE_SAMPLES} preference pairs")
+          f"{len(train_ds)} pairs (Anthropic HH-RLHF)")
     policy.train()
 
     for step in range(MAX_STEPS):
 
-        # ── Eval ──
+        # ── Eval ──────────────────────────────────────────────────────────────
         if step % EVAL_INTERVAL == 0 or step == MAX_STEPS - 1:
             policy.eval()
             vl, va, n = 0.0, 0.0, 0
@@ -509,7 +307,7 @@ def train(args=None):
                       f"pref-accuracy {va/n*100:.1f}%\n")
             policy.train()
 
-        # ── Train ──
+        # ── Train ─────────────────────────────────────────────────────────────
         optimizer.zero_grad(set_to_none=True)
         acc_l, acc_a = 0.0, 0.0
 
@@ -552,7 +350,8 @@ def train(args=None):
 
     print("\n" + "="*60)
     print("DPO TRAINING COMPLETE! 🎉")
-    print("Model aligned by 1000 Mimo-judged preference pairs.")
+    print(f"Trained on {len(train_ds)} human preference pairs (HH-RLHF)")
+    print("Same training method as Llama 2, Vicuna, Mistral!")
     print("="*60)
 
 
