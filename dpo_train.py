@@ -151,7 +151,7 @@ def mimo_judge_three(instruction, resp_a, resp_b, resp_c, api_key, retries=3):
     for attempt in range(retries):
         try:
             r    = requests.post(MIMO_API_URL, headers=headers,
-                                 json=payload, timeout=30)
+                                 json=payload, timeout=60)
             r.raise_for_status()
             text = r.json()["choices"][0]["message"]["content"].strip()
 
