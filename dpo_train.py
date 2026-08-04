@@ -370,6 +370,27 @@ def train(args=None):
     if not api_key:
         print("ERROR: MIMO_API_KEY not set!"); return
 
+    # ── Mimo connectivity ping ────────────────────────────────────────────────
+    print("\n🔌 Pinging Mimo API... ", end="", flush=True)
+    try:
+        _r = requests.post(
+            MIMO_API_URL,
+            headers={"Authorization": f"Bearer {api_key}",
+                     "Content-Type":  "application/json"},
+            json={"model": JUDGE_MODEL,
+                  "messages": [{"role": "user", "content": "Reply with just: OK"}],
+                  "temperature": 0.0, "stream": False},
+            timeout=60,
+        )
+        _r.raise_for_status()
+        _reply = _r.json()["choices"][0]["message"]["content"].strip()
+        print(f"✅ Mimo is live! Response: {_reply!r}")
+    except Exception as _e:
+        print(f"\n❌ Mimo is NOT reachable: {_e}")
+        print("Fix: check MIMO_API_KEY or network, then restart.")
+        return
+    # ─────────────────────────────────────────────────────────────────────────
+
     device      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     device_type = "cuda" if device.type == "cuda" else "cpu"
     print(f"Device: {device}")
