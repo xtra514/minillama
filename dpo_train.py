@@ -1,26 +1,26 @@
 """
-dpo_train.py
-Phase 3: RLAIF + DPO using Mimo as AI judge.
+dpo_train.py  —  Phase 3: RLAIF + DPO with Mimo as judge (FULL SCALE)
 
-How it works:
-  1. Load SFT model from HuggingFace Hub
-  2. Generate 2 different responses per instruction (temp 0.7 vs 1.1)
-  3. Mimo judges which is better → (instruction, chosen, rejected)
-  4. Train with DPO loss → model learns to prefer "good" responses
+Pipeline:
+  1. Load SFT model from HuggingFace
+  2. Generate 3 responses per instruction (temp 0.6 / 0.9 / 1.2)
+  3. Mimo judges all 3 and picks BEST and WORST
+  4. Build (instruction, best, worst) preference triplets
+  5. Train DPO loss — model strongly prefers best over worst
+  6. Save checkpoints to HuggingFace
 
-DPO loss:
-  L = -log σ(β * [log π(chosen)/π_ref(chosen) - log π(rejected)/π_ref(rejected)])
+Scale: 1000 pairs × 2000 DPO steps = maximum alignment signal.
 
 Kaggle usage:
     import minillama.dpo_train as dt
     dt.train(args=Args())
 
-Set MIMO_API_KEY as a Kaggle secret before running.
+Requires: HF_TOKEN, MIMO_API_KEY as Kaggle secrets.
 """
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import os, json, time, glob, requests
+import os, json, time, glob, requests, random
 from contextlib import nullcontext
 from torch.utils.data import Dataset, DataLoader
 from tokenizers import Tokenizer
@@ -33,21 +33,27 @@ from minillama.config import CONFIG_100M
 _REPO_ROOT        = os.path.dirname(os.path.abspath(__file__))
 TOKENIZER_PATH    = os.path.join(_REPO_ROOT, "data", "tokenizer_32k.json")
 PREF_DATA_PATH    = os.path.join(_REPO_ROOT, "dpo_preferences.json")
-PREF_DATA_HF_FILE = "dpo_preferences.json"   # name on HF Hub
+PREF_DATA_HF_FILE = "dpo_preferences.json"
 
-NUM_JUDGE_SAMPLES = 200     # preference pairs to generate (fits in ~40 mins)
-BATCH_SIZE        = 1       # DPO needs 2× forward passes per item; keep small
-GRAD_ACCUM        = 8
-MAX_LENGTH        = 256     # short responses only — keeps generation fast
-LEARNING_RATE     = 5e-7    # tiny — don't destroy SFT
-BETA              = 0.1     # DPO temperature
-MAX_STEPS         = 600     # enough for 200 pairs × 3 epochs
-WARMUP_STEPS      = 30
-EVAL_INTERVAL     = 100
-SAVE_INTERVAL     = 200
+# ── Scale knobs (FULL) ────────────────────────────────────────────────────────
+NUM_JUDGE_SAMPLES = 1000    # preference pairs — unlimited API so go big
+GEN_TEMPERATURES  = [0.6, 0.9, 1.2]   # 3 candidates per prompt
+GEN_MAX_TOKENS    = 200     # per candidate response
+MAX_LENGTH        = 512     # DPO training sequence length
 
-MIMO_API_URL   = "http://liiwerwp3f3px714nj2yozh0.161.118.160.111.sslip.io/v1/chat/completions"
-JUDGE_MODEL    = "mimo-v2.5-free"
+# ── DPO training ──────────────────────────────────────────────────────────────
+BATCH_SIZE     = 1
+GRAD_ACCUM     = 8
+LEARNING_RATE  = 5e-7       # tiny — preserve SFT knowledge
+BETA           = 0.1        # DPO temperature
+MAX_STEPS      = 2_000
+WARMUP_STEPS   = 100
+EVAL_INTERVAL  = 200
+SAVE_INTERVAL  = 500
+
+# ── API ───────────────────────────────────────────────────────────────────────
+MIMO_API_URL  = "http://liiwerwp3f3px714nj2yozh0.161.118.160.111.sslip.io/v1/chat/completions"
+JUDGE_MODEL   = "mimo-v2.5-free"
 
 SFT_PREFIX = "minillama_125m_sft_step"
 DPO_PREFIX = "minillama_125m_dpo_step"
@@ -67,7 +73,7 @@ def hf_push(local_path, hf_repo, hf_token):
                         repo_id=hf_repo)
         print(f"  ✓ Uploaded {os.path.basename(local_path)} → hf.co/{hf_repo}")
     except Exception as e:
-        print(f"  ⚠ HF upload failed (non-fatal): {e}")
+        print(f"  ⚠ HF upload failed: {e}")
 
 
 def hf_pull_file(hf_repo, hf_token, filename):
@@ -77,9 +83,10 @@ def hf_pull_file(hf_repo, hf_token, filename):
         files = list(api.list_repo_files(hf_repo))
         if filename not in files:
             return None
-        return hf_hub_download(repo_id=hf_repo, filename=filename, token=hf_token)
+        return hf_hub_download(repo_id=hf_repo, filename=filename,
+                                token=hf_token)
     except Exception as e:
-        print(f"  ⚠ HF download ({filename}) failed: {e}")
+        print(f"  ⚠ HF download ({filename}): {e}")
         return None
 
 
@@ -96,31 +103,50 @@ def hf_pull_latest(hf_repo, hf_token, prefix):
             return None, None
         target = ckpts[-1]
         step   = int(target.replace(prefix + "_", "").replace(".pt", ""))
-        print(f"  Downloading {target}...")
-        local  = hf_hub_download(repo_id=hf_repo, filename=target, token=hf_token)
+        print(f"  Downloading {target} from HF Hub...")
+        local  = hf_hub_download(repo_id=hf_repo, filename=target,
+                                  token=hf_token)
+        print(f"  Downloaded to {local}")
         return local, step
     except Exception as e:
-        print(f"  ⚠ HF pull ({prefix}) failed: {e}")
+        print(f"  ⚠ HF pull ({prefix}): {e}")
         return None, None
 
-# ── Mimo AI Judge ─────────────────────────────────────────────────────────────
+# ── Mimo AI Judge — multi-criteria ───────────────────────────────────────────
 
-def mimo_judge(instruction, resp_a, resp_b, api_key, retries=3):
-    """Ask Mimo to pick the better response. Returns 'A' or 'B'."""
+JUDGE_SYSTEM = (
+    "You are an expert AI evaluator. Score each response on:\n"
+    "1. Helpfulness — does it actually answer the instruction?\n"
+    "2. Accuracy    — is the information correct?\n"
+    "3. Clarity     — is it easy to understand?\n"
+    "4. Completeness — does it cover all aspects?\n"
+    "Be strict and objective."
+)
+
+def mimo_judge_three(instruction, resp_a, resp_b, resp_c, api_key, retries=3):
+    """
+    Ask Mimo to rank 3 responses and return (best_letter, worst_letter).
+    Returns e.g. ('A', 'C') meaning A is best, C is worst.
+    """
     prompt = (
-        "You are a strict AI judge. Given an instruction and two responses, "
-        "decide which is better. Reply with ONLY 'CHOSEN: A' or 'CHOSEN: B'.\n\n"
         f"Instruction: {instruction}\n\n"
-        f"Response A: {resp_a}\n\n"
-        f"Response B: {resp_b}"
+        f"Response A:\n{resp_a}\n\n"
+        f"Response B:\n{resp_b}\n\n"
+        f"Response C:\n{resp_c}\n\n"
+        "Rank these responses from best to worst based on helpfulness, "
+        "accuracy, clarity, and completeness.\n"
+        "Reply in EXACTLY this format:\n"
+        "BEST: X\nWORST: Y\n"
+        "where X and Y are A, B, or C."
     )
     headers = {"Authorization": f"Bearer {api_key}",
-               "Content-Type": "application/json"}
+               "Content-Type":  "application/json"}
     payload = {
-        "model": JUDGE_MODEL,
-        "messages": [{"role": "user", "content": prompt}],
+        "model":       JUDGE_MODEL,
+        "messages":    [{"role": "system", "content": JUDGE_SYSTEM},
+                        {"role": "user",   "content": prompt}],
         "temperature": 0.1,
-        "stream": False,
+        "stream":      False,
     }
     for attempt in range(retries):
         try:
@@ -128,30 +154,46 @@ def mimo_judge(instruction, resp_a, resp_b, api_key, retries=3):
                                  json=payload, timeout=30)
             r.raise_for_status()
             text = r.json()["choices"][0]["message"]["content"].strip()
-            if "CHOSEN: A" in text or text.startswith("A"):
-                return "A"
-            elif "CHOSEN: B" in text or text.startswith("B"):
-                return "B"
-            else:
-                return "A"   # default on ambiguity
+
+            best  = None
+            worst = None
+            for line in text.splitlines():
+                l = line.strip().upper()
+                if l.startswith("BEST:") and not best:
+                    c = l.replace("BEST:", "").strip()[:1]
+                    if c in ("A", "B", "C"):
+                        best = c
+                if l.startswith("WORST:") and not worst:
+                    c = l.replace("WORST:", "").strip()[:1]
+                    if c in ("A", "B", "C"):
+                        worst = c
+
+            if best and worst and best != worst:
+                return best, worst
+            # fallback: try single-letter parse
+            letters = [w for w in text.split() if w in ("A", "B", "C")]
+            if len(letters) >= 2:
+                return letters[0], letters[-1]
+
         except Exception as e:
             print(f"  ⚠ Judge error (attempt {attempt+1}): {e}")
             time.sleep(2 ** attempt)
-    return "A"
+
+    # Default fallback
+    return "A", "C"
 
 # ── Response Generation ───────────────────────────────────────────────────────
 
 @torch.no_grad()
 def generate_response(raw_model, tokenizer, instruction, device,
-                      temperature=0.9, max_tokens=150):
-    """Generate one response from the raw (non-DataParallel) model."""
+                      temperature=0.9, max_tokens=GEN_MAX_TOKENS):
     raw_model.eval()
     prompt = INSTRUCTION_PREFIX + instruction + RESPONSE_PREFIX
     ids    = tokenizer.encode(prompt, add_special_tokens=False).ids
     x      = torch.tensor([ids], dtype=torch.long, device=device)
     eos    = tokenizer.token_to_id("</s>") or 2
 
-    generated = []
+    out = []
     for i in range(max_tokens):
         logits, _ = raw_model(x[:, -CONFIG_100M.max_position_embeddings:])
         logits     = logits[:, -1, :] / max(temperature, 1e-6)
@@ -162,44 +204,41 @@ def generate_response(raw_model, tokenizer, instruction, device,
         x   = torch.cat([x, tok], dim=1)
         if tok.item() == eos:
             break
-        generated.append(tok.item())
+        out.append(tok.item())
 
-    return tokenizer.decode(generated).strip()
+    return tokenizer.decode(out).strip()
 
 # ── Preference Dataset Builder ────────────────────────────────────────────────
 
 def build_preference_dataset(raw_model, tokenizer, device,
-                              api_key, hf_repo, hf_token, n=200):
-    # Try loading cached from local or HF Hub
+                              api_key, hf_repo, hf_token, n=1000):
+    # Try local cache
+    data = []
     if os.path.exists(PREF_DATA_PATH):
         with open(PREF_DATA_PATH) as f:
             data = json.load(f)
         print(f"Loaded {len(data)} cached preference pairs.")
         if len(data) >= n:
+            print("Preference dataset complete (cached).")
             return data
-        print(f"Only {len(data)} pairs cached, need {n}. Continuing...")
-    else:
-        # Try downloading from HF Hub
-        if hf_repo and hf_token:
-            local = hf_pull_file(hf_repo, hf_token, PREF_DATA_HF_FILE)
-            if local:
-                import shutil
-                shutil.copy(local, PREF_DATA_PATH)
-                with open(PREF_DATA_PATH) as f:
-                    data = json.load(f)
-                print(f"Downloaded {len(data)} preference pairs from HF Hub.")
-                if len(data) >= n:
-                    return data
-            else:
-                data = []
-        else:
-            data = []
 
-    already = len(data)
-    print(f"Generating {n - already} more preference pairs with Mimo judge...")
+    # Try HF Hub cache
+    if not data and hf_repo and hf_token:
+        local = hf_pull_file(hf_repo, hf_token, PREF_DATA_HF_FILE)
+        if local:
+            import shutil
+            shutil.copy(local, PREF_DATA_PATH)
+            with open(PREF_DATA_PATH) as f:
+                data = json.load(f)
+            print(f"Downloaded {len(data)} pairs from HF Hub.")
+            if len(data) >= n:
+                return data
+
+    print(f"\nGenerating {n - len(data)} preference pairs "
+          f"({len(GEN_TEMPERATURES)} candidates each, Mimo 3-way judge)...")
 
     ds = load_dataset("tatsu-lab/alpaca", split="train")
-    ds = ds.shuffle(seed=99).select(range(min(n * 3, len(ds))))
+    ds = ds.shuffle(seed=77).select(range(min(n * 4, len(ds))))
 
     for row in ds:
         if len(data) >= n:
@@ -209,28 +248,43 @@ def build_preference_dataset(raw_model, tokenizer, device,
         if row.get("input", "").strip():
             instruction += "\n" + row["input"].strip()
 
-        # Generate two responses with different temperatures
-        resp_a = generate_response(raw_model, tokenizer, instruction,
-                                    device, temperature=0.7)
-        resp_b = generate_response(raw_model, tokenizer, instruction,
-                                    device, temperature=1.1)
+        # Generate 3 candidates at different temperatures
+        candidates = []
+        for temp in GEN_TEMPERATURES:
+            r = generate_response(raw_model, tokenizer, instruction,
+                                   device, temperature=temp)
+            candidates.append(r)
 
-        # Skip near-identical responses
-        if resp_a.strip() == resp_b.strip() or not resp_a or not resp_b:
+        # Skip if too similar
+        unique = set(c.strip()[:50] for c in candidates if c)
+        if len(unique) < 2:
             continue
 
-        winner = mimo_judge(instruction, resp_a, resp_b, api_key)
-        chosen   = resp_a if winner == "A" else resp_b
-        rejected = resp_b if winner == "A" else resp_a
+        resp_a, resp_b, resp_c = candidates[0], candidates[1], candidates[2]
 
-        data.append({"instruction": instruction,
-                     "chosen":      chosen,
-                     "rejected":    rejected})
+        # Judge
+        best_letter, worst_letter = mimo_judge_three(
+            instruction, resp_a, resp_b, resp_c, api_key
+        )
+
+        letter_map = {"A": resp_a, "B": resp_b, "C": resp_c}
+        chosen   = letter_map.get(best_letter,  resp_a)
+        rejected = letter_map.get(worst_letter, resp_c)
+
+        if chosen == rejected:
+            continue
+
+        data.append({
+            "instruction": instruction,
+            "chosen":      chosen,
+            "rejected":    rejected,
+            "best":        best_letter,
+            "worst":       worst_letter,
+        })
 
         if len(data) % 10 == 0:
-            print(f"  [{len(data)}/{n}] Winner={winner} | "
-                  f"chosen[:60]={chosen[:60]!r}")
-            # Save progress
+            print(f"  [{len(data):4d}/{n}] best={best_letter} | "
+                  f"chosen[:50]={chosen[:50]!r}")
             with open(PREF_DATA_PATH, "w") as f:
                 json.dump(data, f, indent=2)
             if hf_repo and hf_token:
@@ -241,73 +295,65 @@ def build_preference_dataset(raw_model, tokenizer, device,
     if hf_repo and hf_token:
         hf_push(PREF_DATA_PATH, hf_repo, hf_token)
 
-    print(f"Preference dataset complete: {len(data)} pairs.")
+    print(f"✓ Preference dataset: {len(data)} pairs saved.")
     return data
 
 # ── DPO Dataset ───────────────────────────────────────────────────────────────
 
 class DPODataset(Dataset):
-    def __init__(self, prefs, tokenizer, max_length=256):
-        self.data       = prefs
-        self.tokenizer  = tokenizer
-        self.max_length = max_length
-        self.eos_id     = tokenizer.token_to_id("</s>") or 2
+    def __init__(self, prefs, tokenizer, max_length=512):
+        self.data      = prefs
+        self.tok       = tokenizer
+        self.max_len   = max_length
+        self.eos       = tokenizer.token_to_id("</s>") or 2
+        self.instr_ids = tokenizer.encode(INSTRUCTION_PREFIX,
+                                           add_special_tokens=False).ids
+        self.resp_ids  = tokenizer.encode(RESPONSE_PREFIX,
+                                           add_special_tokens=False).ids
 
-        self.instr_ids = tokenizer.encode(
-            INSTRUCTION_PREFIX, add_special_tokens=False).ids
-        self.resp_ids  = tokenizer.encode(
-            RESPONSE_PREFIX, add_special_tokens=False).ids
-
-    def _encode(self, instruction, response):
-        p_ids = (self.instr_ids
-                 + self.tokenizer.encode(instruction,
-                                         add_special_tokens=False).ids
-                 + self.resp_ids)
-        r_ids = (self.tokenizer.encode(response,
-                                        add_special_tokens=False).ids
-                 + [self.eos_id])
-        full   = (p_ids + r_ids)[:self.max_length]
-        labels = ([-100] * len(p_ids) + r_ids)[:self.max_length]
-        pad    = self.max_length - len(full)
-        full   += [0]    * pad
-        labels += [-100] * pad
-        return (torch.tensor(full,   dtype=torch.long),
-                torch.tensor(labels, dtype=torch.long))
+    def _enc(self, instruction, response):
+        p = (self.instr_ids
+             + self.tok.encode(instruction, add_special_tokens=False).ids
+             + self.resp_ids)
+        r = self.tok.encode(response, add_special_tokens=False).ids + [self.eos]
+        full   = (p + r)[:self.max_len]
+        labels = ([-100] * len(p) + r)[:self.max_len]
+        pad    = self.max_len - len(full)
+        return (torch.tensor(full   + [0]    * pad, dtype=torch.long),
+                torch.tensor(labels + [-100] * pad, dtype=torch.long))
 
     def __len__(self):  return len(self.data)
 
-    def __getitem__(self, idx):
-        row = self.data[idx]
-        c_ids, c_lab = self._encode(row["instruction"], row["chosen"])
-        r_ids, r_lab = self._encode(row["instruction"], row["rejected"])
-        return c_ids, c_lab, r_ids, r_lab
+    def __getitem__(self, i):
+        row = self.data[i]
+        ci, cl = self._enc(row["instruction"], row["chosen"])
+        ri, rl = self._enc(row["instruction"], row["rejected"])
+        return ci, cl, ri, rl
 
 # ── DPO Loss ──────────────────────────────────────────────────────────────────
 
-def _log_probs(m, input_ids, labels, vocab_size):
-    """Compute mean per-token log-prob for labelled tokens."""
-    logits, _ = m(input_ids)
+def _mean_log_prob(m, ids, labels, vocab_size):
+    logits, _    = m(ids)
     shift_logits = logits[:, :-1].contiguous().view(-1, vocab_size)
     shift_labels = labels[:, 1:].contiguous().view(-1)
     mask         = shift_labels != -100
     if mask.sum() == 0:
-        return torch.tensor(0.0, device=input_ids.device,
-                            requires_grad=m.training)
-    log_p     = F.log_softmax(shift_logits, dim=-1)
-    token_lp  = log_p.gather(1, shift_labels.clamp(min=0).unsqueeze(1)).squeeze(1)
-    return (token_lp * mask).sum() / mask.sum()
+        return torch.tensor(0.0, device=ids.device, requires_grad=m.training)
+    lp   = F.log_softmax(shift_logits, dim=-1)
+    tlp  = lp.gather(1, shift_labels.clamp(min=0).unsqueeze(1)).squeeze(1)
+    return (tlp * mask).sum() / mask.sum()
 
 
-def compute_dpo_loss(policy, ref, c_ids, c_lab, r_ids, r_lab, beta, vocab_size):
+def dpo_loss(policy, ref, c_ids, c_lab, r_ids, r_lab, beta, vocab_size):
     with torch.no_grad():
-        ref_c = _log_probs(ref, c_ids, c_lab, vocab_size)
-        ref_r = _log_probs(ref, r_ids, r_lab, vocab_size)
+        ref_c = _mean_log_prob(ref, c_ids, c_lab, vocab_size)
+        ref_r = _mean_log_prob(ref, r_ids, r_lab, vocab_size)
 
-    pol_c = _log_probs(policy, c_ids, c_lab, vocab_size)
-    pol_r = _log_probs(policy, r_ids, r_lab, vocab_size)
+    pol_c = _mean_log_prob(policy, c_ids, c_lab, vocab_size)
+    pol_r = _mean_log_prob(policy, r_ids, r_lab, vocab_size)
 
-    ratio = beta * ((pol_c - ref_c) - (pol_r - ref_r))
-    loss  = -F.logsigmoid(ratio)
+    reward_gap = beta * ((pol_c - ref_c) - (pol_r - ref_r))
+    loss       = -F.logsigmoid(reward_gap)
 
     with torch.no_grad():
         acc = ((pol_c - ref_c) > (pol_r - ref_r)).float()
@@ -317,44 +363,41 @@ def compute_dpo_loss(policy, ref, c_ids, c_lab, r_ids, r_lab, beta, vocab_size):
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def train(args=None):
-    hf_repo  = args.hf_repo  if args and hasattr(args, "hf_repo")  else None
+    hf_repo  = args.hf_repo if args and hasattr(args, "hf_repo") else None
     hf_token = os.environ.get("HF_TOKEN", None)
     api_key  = os.environ.get("MIMO_API_KEY", "")
 
     if not api_key:
-        print("ERROR: MIMO_API_KEY not set!")
-        return
+        print("ERROR: MIMO_API_KEY not set!"); return
 
     device      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     device_type = "cuda" if device.type == "cuda" else "cpu"
     print(f"Device: {device}")
 
-    # Tokenizer
     tokenizer  = Tokenizer.from_file(TOKENIZER_PATH)
     vocab_size = tokenizer.get_vocab_size()
     print(f"Tokenizer: {vocab_size} tokens")
 
-    # Build model config
     config            = CONFIG_100M
     config.vocab_size = vocab_size
 
-    # ── Load SFT checkpoint ──
-    print("Loading SFT model from HF Hub...")
+    # Load SFT weights
+    print("Loading SFT checkpoint from HF Hub...")
     ckpt_path, _ = hf_pull_latest(hf_repo, hf_token, SFT_PREFIX)
     if not ckpt_path:
-        print("ERROR: No SFT checkpoint found! Run finetune_chat.py first.")
-        return
+        print("ERROR: No SFT checkpoint! Run finetune_chat.py first."); return
 
-    state = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    state = state.get("model_state_dict", state)
-    state = {k.replace("module.", ""): v for k, v in state.items()}
+    raw_state = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    state     = raw_state.get("model_state_dict", raw_state)
+    state     = {k.replace("module.", ""): v for k, v in state.items()}
 
-    # Policy model (trained during DPO)
+    # Policy model
     policy = MiniLlama(config)
     policy.load_state_dict(state, strict=False)
     policy.to(device)
+    raw = policy   # keep reference before DataParallel wrap
 
-    # Reference model (frozen copy of SFT)
+    # Reference model (frozen)
     ref = MiniLlama(config)
     ref.load_state_dict(state, strict=False)
     ref.to(device)
@@ -364,18 +407,16 @@ def train(args=None):
 
     print(f"Policy: {sum(p.numel() for p in policy.parameters()):,} params | Ref: frozen")
 
-    # raw = policy before DataParallel (used for generation)
-    raw = policy
-
     if torch.cuda.device_count() > 1:
         print(f"Using {torch.cuda.device_count()} GPUs")
         policy = nn.DataParallel(policy)
 
-    # ── Phase 3a: Build preference dataset ──
+    # ── Phase 3a: Preference Dataset ─────────────────────────────────────────
     prefs = build_preference_dataset(
         raw, tokenizer, device, api_key, hf_repo, hf_token,
         n=NUM_JUDGE_SAMPLES
     )
+    random.shuffle(prefs)
 
     split    = int(0.95 * len(prefs))
     train_ds = DPODataset(prefs[:split], tokenizer, MAX_LENGTH)
@@ -389,7 +430,7 @@ def train(args=None):
     train_iter = iter(train_loader)
     val_iter   = iter(val_loader)
 
-    # ── Phase 3b: DPO Training ──
+    # ── Phase 3b: DPO Training ────────────────────────────────────────────────
     optimizer = torch.optim.AdamW(
         policy.parameters(), lr=LEARNING_RATE,
         weight_decay=0.01, betas=(0.9, 0.95)
@@ -403,57 +444,54 @@ def train(args=None):
     ctx = (torch.amp.autocast(device_type="cuda", dtype=dtype)
            if device_type == "cuda" else nullcontext())
 
-    print(f"\nStarting DPO training for {MAX_STEPS} steps (β={BETA})...")
+    print(f"\nStarting DPO — {MAX_STEPS} steps | β={BETA} | "
+          f"{NUM_JUDGE_SAMPLES} preference pairs")
     policy.train()
 
     for step in range(MAX_STEPS):
 
-        # Eval
+        # ── Eval ──
         if step % EVAL_INTERVAL == 0 or step == MAX_STEPS - 1:
             policy.eval()
             vl, va, n = 0.0, 0.0, 0
             with torch.no_grad():
-                for _ in range(min(len(val_loader), 20)):
+                for _ in range(min(len(val_loader), 30)):
                     try:
-                        c_ids, c_lab, r_ids, r_lab = next(val_iter)
+                        ci, cl, ri, rl = next(val_iter)
                     except StopIteration:
                         val_iter = iter(val_loader)
-                        c_ids, c_lab, r_ids, r_lab = next(val_iter)
-                    c_ids, c_lab = c_ids.to(device), c_lab.to(device)
-                    r_ids, r_lab = r_ids.to(device), r_lab.to(device)
-                    loss, acc = compute_dpo_loss(
-                        policy, ref, c_ids, c_lab, r_ids, r_lab,
-                        BETA, vocab_size
-                    )
-                    vl += loss.item(); va += acc.item(); n += 1
-            if n > 0:
-                print(f"Step {step:4d} | val loss {vl/n:.4f} | "
-                      f"preference acc {va/n*100:.1f}%")
+                        ci, cl, ri, rl = next(val_iter)
+                    ci, cl = ci.to(device), cl.to(device)
+                    ri, rl = ri.to(device), rl.to(device)
+                    l, a   = dpo_loss(policy, ref, ci, cl, ri, rl,
+                                      BETA, vocab_size)
+                    vl += l.item(); va += a.item(); n += 1
+            if n:
+                print(f"\nStep {step:5d} | val loss {vl/n:.4f} | "
+                      f"pref-accuracy {va/n*100:.1f}%\n")
             policy.train()
 
-        # Train
+        # ── Train ──
         optimizer.zero_grad(set_to_none=True)
-        acc_loss, acc_acc = 0.0, 0.0
+        acc_l, acc_a = 0.0, 0.0
 
         for _ in range(GRAD_ACCUM):
             try:
-                c_ids, c_lab, r_ids, r_lab = next(train_iter)
+                ci, cl, ri, rl = next(train_iter)
             except StopIteration:
                 train_iter = iter(train_loader)
-                c_ids, c_lab, r_ids, r_lab = next(train_iter)
-            c_ids, c_lab = c_ids.to(device), c_lab.to(device)
-            r_ids, r_lab = r_ids.to(device), r_lab.to(device)
+                ci, cl, ri, rl = next(train_iter)
+            ci, cl = ci.to(device), cl.to(device)
+            ri, rl = ri.to(device), rl.to(device)
 
             with ctx:
-                loss, acc = compute_dpo_loss(
-                    policy, ref, c_ids, c_lab, r_ids, r_lab,
-                    BETA, vocab_size
-                )
-                loss = loss / GRAD_ACCUM
+                l, a = dpo_loss(policy, ref, ci, cl, ri, rl,
+                                BETA, vocab_size)
+                l    = l / GRAD_ACCUM
 
-            scaler.scale(loss).backward()
-            acc_loss += loss.item() * GRAD_ACCUM
-            acc_acc  += acc.item()
+            scaler.scale(l).backward()
+            acc_l += l.item() * GRAD_ACCUM
+            acc_a += a.item()
 
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
@@ -462,21 +500,22 @@ def train(args=None):
         lr = scheduler.step(step)
 
         if step % 10 == 0:
-            print(f"Step {step:4d} | loss {acc_loss:.4f} | "
-                  f"acc {acc_acc/GRAD_ACCUM*100:.1f}% | lr {lr:.2e}")
+            print(f"Step {step:5d} | loss {acc_l:.4f} | "
+                  f"acc {acc_a/GRAD_ACCUM*100:.1f}% | lr {lr:.2e}")
 
         if (step > 0 and step % SAVE_INTERVAL == 0) or step == MAX_STEPS - 1:
-            r = policy.module if hasattr(policy, "module") else policy
+            r    = policy.module if hasattr(policy, "module") else policy
             name = f"{DPO_PREFIX}_{step}.pt"
-            local = os.path.join(_REPO_ROOT, name)
-            torch.save({"model_state_dict": r.state_dict(), "step": step},
-                       local)
+            lp   = os.path.join(_REPO_ROOT, name)
+            torch.save({"model_state_dict": r.state_dict(), "step": step}, lp)
             print(f"  ✓ Saved: {name}")
             if hf_repo and hf_token:
-                hf_push(local, hf_repo, hf_token)
+                hf_push(lp, hf_repo, hf_token)
 
-    print("\nDPO training complete! 🎉")
-    print("Your model is now aligned by AI. Ready for deployment!")
+    print("\n" + "="*60)
+    print("DPO TRAINING COMPLETE! 🎉")
+    print("Model aligned by 1000 Mimo-judged preference pairs.")
+    print("="*60)
 
 
 if __name__ == "__main__":
