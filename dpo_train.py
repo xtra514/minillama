@@ -16,6 +16,7 @@ Kaggle usage:
 
 Requires: HF_TOKEN as Kaggle secret.
 """
+# NOTE: Loss displayed = average per grad-accum step (not sum)
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -138,6 +139,31 @@ def load_hh_rlhf(n=10_000, seed=42):
     print(f"✓ Parsed {len(pairs)} valid preference pairs from HH-RLHF.")
     return pairs
 
+# ── Generation Preview ────────────────────────────────────────────────────────
+
+@torch.no_grad()
+def _preview(raw_model, tokenizer, device, temperature=0.8, max_tokens=120):
+    raw_model.eval()
+    instruction = "Tell me something interesting about space."
+    prompt = f"### Instruction:\n{instruction}\n### Response:\n"
+    ids    = tokenizer.encode(prompt, add_special_tokens=False).ids
+    x      = torch.tensor([ids], dtype=torch.long, device=device)
+    eos    = tokenizer.token_to_id("</s>") or 2
+
+    out = []
+    for i in range(max_tokens):
+        logits, _ = raw_model(x[:, -CONFIG_100M.max_position_embeddings:])
+        logits     = logits[:, -1, :] / temperature
+        logits[:, 0] = float("-inf")
+        if i < 5: logits[:, eos] = float("-inf")
+        tok = torch.multinomial(F.softmax(logits, dim=-1), 1)
+        x   = torch.cat([x, tok], dim=1)
+        if tok.item() == eos: break
+        out.append(tok.item())
+
+    response = tokenizer.decode(out).strip()
+    print(f"  PREVIEW: {response}")
+
 # ── DPO Dataset ───────────────────────────────────────────────────────────────
 
 class DPODataset(Dataset):
@@ -246,6 +272,7 @@ def train(args=None):
 
     print(f"Policy: {sum(p.numel() for p in policy.parameters()):,} params | Ref: frozen")
 
+    raw = policy   # keep unwrapped ref for generation previews
     if torch.cuda.device_count() > 1:
         print(f"Using {torch.cuda.device_count()} GPUs")
         policy = nn.DataParallel(policy)
@@ -304,7 +331,14 @@ def train(args=None):
                     vl += l.item(); va += a.item(); n += 1
             if n:
                 print(f"\nStep {step:5d} | val loss {vl/n:.4f} | "
-                      f"pref-accuracy {va/n*100:.1f}%\n")
+                      f"pref-accuracy {va/n*100:.1f}%")
+
+            # Generation preview every 200 steps
+            if step % 200 == 0:
+                _preview(raw if torch.cuda.device_count() > 1 else
+                         (policy.module if hasattr(policy, 'module') else policy),
+                         tokenizer, device)
+            print()
             policy.train()
 
         # ── Train ─────────────────────────────────────────────────────────────
@@ -336,7 +370,7 @@ def train(args=None):
         lr = scheduler.step(step)
 
         if step % 10 == 0:
-            print(f"Step {step:5d} | loss {acc_l:.4f} | "
+            print(f"Step {step:5d} | loss {acc_l/GRAD_ACCUM:.4f} | "
                   f"acc {acc_a/GRAD_ACCUM*100:.1f}% | lr {lr:.2e}")
 
         if (step > 0 and step % SAVE_INTERVAL == 0) or step == MAX_STEPS - 1:
