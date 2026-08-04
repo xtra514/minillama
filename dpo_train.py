@@ -1,14 +1,25 @@
 """
-dpo_train.py  —  Phase 3: DPO with Anthropic HH-RLHF Dataset
+dpo_train.py  —  Phase 3: On-Policy Heuristic DPO
 
-Uses the same dataset as Llama 2, Vicuna, Mistral, Zephyr etc.
-169K human-labeled preference pairs — no API judge needed.
+Generates responses from OUR OWN model, scores with quality heuristics,
+trains DPO on the result. This is the correct approach for small models.
+
+Why this works when HH-RLHF doesn't:
+  - On-policy: responses come from our model → distribution matches perfectly
+  - DPO gets a real gradient signal (not stuck at 0.6931)
+  - Proven approach: similar to SPIN / Self-Play Fine-Tuning
+
+Quality heuristics (no API needed):
+  1. No repetition  — penalize repeated 4-grams
+  2. Length         — prefer fuller answers
+  3. Diversity      — unique word ratio
+  4. No degeneration — no single-token loops
 
 Pipeline:
-  1. Load Anthropic/hh-rlhf (human chosen vs rejected pairs)
-  2. Parse into (instruction, chosen, rejected) format
-  3. Train with DPO loss against frozen SFT reference model
-  4. Save checkpoints to HuggingFace
+  1. Generate response_A (temp=0.7) and response_B (temp=1.1) per prompt
+  2. Score both → higher score = chosen, lower = rejected
+  3. Skip pairs that are too similar (no useful signal)
+  4. Train DPO loss → model learns to prefer better responses
 
 Kaggle usage:
     import minillama.dpo_train as dt
@@ -16,11 +27,10 @@ Kaggle usage:
 
 Requires: HF_TOKEN as Kaggle secret.
 """
-# NOTE: Loss displayed = average per grad-accum step (not sum)
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import os, json, re, random
+import os, random
 from contextlib import nullcontext
 from torch.utils.data import Dataset, DataLoader
 from tokenizers import Tokenizer
@@ -33,14 +43,17 @@ from minillama.config import CONFIG_100M
 _REPO_ROOT     = os.path.dirname(os.path.abspath(__file__))
 TOKENIZER_PATH = os.path.join(_REPO_ROOT, "data", "tokenizer_32k.json")
 
-NUM_PAIRS      = 10_000    # subset of HH-RLHF to use (169K available)
-MAX_LENGTH     = 512       # training sequence length
+NUM_PAIRS      = 2_000     # preference pairs to generate on-policy
+GEN_TEMPS      = (0.7, 1.1) # (chosen_temp, rejected_temp) candidates
+GEN_MAX_TOKENS = 150        # tokens per response
+MIN_SCORE_GAP  = 0.05       # skip pair if scores too similar
+MAX_LENGTH     = 512        # DPO training sequence length
 BATCH_SIZE     = 2
 GRAD_ACCUM     = 8
-LEARNING_RATE  = 5e-7      # tiny — preserve SFT knowledge
-BETA           = 0.1       # DPO temperature
-MAX_STEPS      = 2_000
-WARMUP_STEPS   = 100
+LEARNING_RATE  = 1e-6       # slightly higher — on-policy needs more signal
+BETA           = 0.1
+MAX_STEPS      = 1_500
+WARMUP_STEPS   = 50
 EVAL_INTERVAL  = 200
 SAVE_INTERVAL  = 500
 
@@ -62,7 +75,7 @@ def hf_push(local_path, hf_repo, hf_token):
                         repo_id=hf_repo)
         print(f"  ✓ Uploaded {os.path.basename(local_path)} → hf.co/{hf_repo}")
     except Exception as e:
-        print(f"  ⚠ HF upload failed: {e}")
+        print(f"  ⚠ HF upload: {e}")
 
 
 def hf_pull_latest(hf_repo, hf_token, prefix):
@@ -78,65 +91,129 @@ def hf_pull_latest(hf_repo, hf_token, prefix):
             return None, None
         target = ckpts[-1]
         step   = int(target.replace(prefix + "_", "").replace(".pt", ""))
-        print(f"  Downloading {target} from HF Hub...")
+        print(f"  Downloading {target}...")
         local  = hf_hub_download(repo_id=hf_repo, filename=target,
                                   token=hf_token)
         return local, step
     except Exception as e:
-        print(f"  ⚠ HF pull failed: {e}")
+        print(f"  ⚠ HF pull: {e}")
         return None, None
 
-# ── HH-RLHF Parser ───────────────────────────────────────────────────────────
+# ── Quality Heuristics ────────────────────────────────────────────────────────
 
-def parse_hh_pair(chosen_text, rejected_text):
+def quality_score(text: str) -> float:
     """
-    HH-RLHF format:
-      '\n\nHuman: <instruction>\n\nAssistant: <response>'
-
-    Returns (instruction, chosen_response, rejected_response) or None.
+    Score a response 0-1. Higher = better quality.
+    Completely local, no API needed.
     """
-    def extract_last_exchange(text):
-        # Split on Human turns, take last one
-        human_parts = text.split("\n\nHuman: ")
-        if len(human_parts) < 2:
-            return None, None
-        last = human_parts[-1]
-        if "\n\nAssistant: " not in last:
-            return None, None
-        instruction, response = last.split("\n\nAssistant: ", 1)
-        return instruction.strip(), response.strip()
+    tokens = text.strip().split()
+    if len(tokens) < 3:
+        return 0.0
 
-    instr_c, resp_c = extract_last_exchange(chosen_text)
-    instr_r, resp_r = extract_last_exchange(rejected_text)
+    # 1. Length score (prefer 20-80 tokens, penalize very short/long)
+    length_score = min(len(tokens) / 40.0, 1.0) * (1.0 if len(tokens) < 100 else 0.7)
 
-    if not (instr_c and resp_c and resp_r):
-        return None
+    # 2. No repetition — penalize repeated 4-grams
+    ngrams = [tuple(tokens[i:i+4]) for i in range(len(tokens) - 3)]
+    if ngrams:
+        unique_ratio = len(set(ngrams)) / len(ngrams)
+    else:
+        unique_ratio = 1.0
 
-    # Sanity: responses must differ and be non-trivial
-    if resp_c == resp_r or len(resp_c) < 5 or len(resp_r) < 5:
-        return None
+    # 3. Vocabulary diversity — unique words / total words
+    diversity = len(set(tokens)) / max(len(tokens), 1)
 
-    # Use instruction from chosen (they share the same prompt)
-    return {"instruction": instr_c,
-            "chosen":      resp_c,
-            "rejected":    resp_r}
+    # 4. No degeneration — penalize if a single token repeats consecutively
+    degen_penalty = 1.0
+    for i in range(len(tokens) - 2):
+        if tokens[i] == tokens[i+1] == tokens[i+2]:
+            degen_penalty = 0.1
+            break
+
+    score = (length_score * 0.25
+             + unique_ratio * 0.40
+             + diversity   * 0.25
+             + degen_penalty * 0.10)
+
+    return score
+
+# ── On-Policy Response Generation ────────────────────────────────────────────
+
+@torch.no_grad()
+def generate(raw_model, tokenizer, instruction, device,
+             temperature=0.9, max_tokens=GEN_MAX_TOKENS):
+    raw_model.eval()
+    prompt = INSTRUCTION_PREFIX + instruction + RESPONSE_PREFIX
+    ids    = tokenizer.encode(prompt, add_special_tokens=False).ids
+    x      = torch.tensor([ids], dtype=torch.long, device=device)
+    eos    = tokenizer.token_to_id("</s>") or 2
+
+    out = []
+    for i in range(max_tokens):
+        logits, _ = raw_model(x[:, -CONFIG_100M.max_position_embeddings:])
+        logits     = logits[:, -1, :] / max(temperature, 1e-6)
+        logits[:, 0] = float("-inf")
+        if i < 5: logits[:, eos] = float("-inf")
+        tok = torch.multinomial(F.softmax(logits, dim=-1), 1)
+        x   = torch.cat([x, tok], dim=1)
+        if tok.item() == eos: break
+        out.append(tok.item())
+
+    return tokenizer.decode(out).strip()
 
 
-def load_hh_rlhf(n=10_000, seed=42):
-    """Load and parse Anthropic HH-RLHF preference pairs."""
-    print(f"Loading Anthropic/hh-rlhf (n={n})...")
-    ds = load_dataset("Anthropic/hh-rlhf", split="train")
-    ds = ds.shuffle(seed=seed)
+def build_preference_pairs(raw_model, tokenizer, device, n=2000):
+    """Generate n on-policy preference pairs using heuristic scoring."""
+    print(f"\nGenerating {n} on-policy preference pairs (heuristic scoring)...")
+    ds = load_dataset("tatsu-lab/alpaca", split="train")
+    ds = ds.shuffle(seed=42)
 
-    pairs = []
+    pairs, skipped = [], 0
+
     for row in ds:
         if len(pairs) >= n:
             break
-        parsed = parse_hh_pair(row["chosen"], row["rejected"])
-        if parsed:
-            pairs.append(parsed)
 
-    print(f"✓ Parsed {len(pairs)} valid preference pairs from HH-RLHF.")
+        instruction = row["instruction"].strip()
+        if row.get("input", "").strip():
+            instruction += "\n" + row["input"].strip()
+
+        # Generate two responses at different temperatures
+        resp_a = generate(raw_model, tokenizer, instruction, device,
+                          temperature=GEN_TEMPS[0])
+        resp_b = generate(raw_model, tokenizer, instruction, device,
+                          temperature=GEN_TEMPS[1])
+
+        if not resp_a or not resp_b:
+            skipped += 1
+            continue
+
+        score_a = quality_score(resp_a)
+        score_b = quality_score(resp_b)
+
+        # Skip if gap too small (not useful signal)
+        if abs(score_a - score_b) < MIN_SCORE_GAP:
+            skipped += 1
+            continue
+
+        if score_a >= score_b:
+            chosen, rejected = resp_a, resp_b
+        else:
+            chosen, rejected = resp_b, resp_a
+
+        pairs.append({"instruction": instruction,
+                      "chosen":      chosen,
+                      "rejected":    rejected,
+                      "score_gap":   abs(score_a - score_b)})
+
+        if len(pairs) % 100 == 0:
+            avg_gap = sum(p["score_gap"] for p in pairs) / len(pairs)
+            print(f"  [{len(pairs):4d}/{n}] avg_score_gap={avg_gap:.3f} | "
+                  f"skipped={skipped} | "
+                  f"chosen[:50]={chosen[:50]!r}")
+
+    print(f"✓ Built {len(pairs)} preference pairs "
+          f"(skipped {skipped} low-contrast pairs).")
     return pairs
 
 # ── Generation Preview ────────────────────────────────────────────────────────
@@ -145,7 +222,7 @@ def load_hh_rlhf(n=10_000, seed=42):
 def _preview(raw_model, tokenizer, device, temperature=0.8, max_tokens=120):
     raw_model.eval()
     instruction = "Tell me something interesting about space."
-    prompt = f"### Instruction:\n{instruction}\n### Response:\n"
+    prompt = INSTRUCTION_PREFIX + instruction + RESPONSE_PREFIX
     ids    = tokenizer.encode(prompt, add_special_tokens=False).ids
     x      = torch.tensor([ids], dtype=torch.long, device=device)
     eos    = tokenizer.token_to_id("</s>") or 2
@@ -161,8 +238,7 @@ def _preview(raw_model, tokenizer, device, temperature=0.8, max_tokens=120):
         if tok.item() == eos: break
         out.append(tok.item())
 
-    response = tokenizer.decode(out).strip()
-    print(f"  PREVIEW: {response}")
+    print(f"  PREVIEW: {tokenizer.decode(out).strip()}")
 
 # ── DPO Dataset ───────────────────────────────────────────────────────────────
 
@@ -178,12 +254,10 @@ class DPODataset(Dataset):
                                          add_special_tokens=False).ids
 
     def _encode(self, instruction, response):
-        # Truncate instruction to avoid overflow
         instr_ids = self.tok.encode(instruction,
                                      add_special_tokens=False).ids[:200]
         resp_ids  = self.tok.encode(response,
                                      add_special_tokens=False).ids[:250]
-
         p      = self.instr_p + instr_ids + self.resp_p
         r      = resp_ids + [self.eos]
         full   = (p + r)[:self.max_len]
@@ -250,19 +324,16 @@ def train(args=None):
     print("\nLoading SFT checkpoint from HF Hub...")
     ckpt_path, _ = hf_pull_latest(hf_repo, hf_token, SFT_PREFIX)
     if not ckpt_path:
-        print("ERROR: No SFT checkpoint found! Run finetune_chat.py first.")
-        return
+        print("ERROR: No SFT checkpoint!"); return
 
     raw_state = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     state     = raw_state.get("model_state_dict", raw_state)
     state     = {k.replace("module.", ""): v for k, v in state.items()}
 
-    # Policy model (trained)
     policy = MiniLlama(config)
     policy.load_state_dict(state, strict=False)
     policy.to(device)
 
-    # Reference model (frozen)
     ref = MiniLlama(config)
     ref.load_state_dict(state, strict=False)
     ref.to(device)
@@ -272,19 +343,19 @@ def train(args=None):
 
     print(f"Policy: {sum(p.numel() for p in policy.parameters()):,} params | Ref: frozen")
 
-    raw = policy   # keep unwrapped ref for generation previews
+    raw = policy   # unwrapped for generation
     if torch.cuda.device_count() > 1:
         print(f"Using {torch.cuda.device_count()} GPUs")
         policy = nn.DataParallel(policy)
 
-    # ── Load HH-RLHF dataset ─────────────────────────────────────────────────
-    pairs = load_hh_rlhf(n=NUM_PAIRS)
+    # ── Build on-policy preference dataset ───────────────────────────────────
+    pairs = build_preference_pairs(raw, tokenizer, device, n=NUM_PAIRS)
     random.shuffle(pairs)
 
     split    = int(0.95 * len(pairs))
     train_ds = DPODataset(pairs[:split], tokenizer, MAX_LENGTH)
     val_ds   = DPODataset(pairs[split:], tokenizer, MAX_LENGTH)
-    print(f"DPO dataset — Train: {len(train_ds)} | Val: {len(val_ds)}")
+    print(f"\nDPO dataset — Train: {len(train_ds)} | Val: {len(val_ds)}")
 
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE,
                               shuffle=True,  drop_last=True,  num_workers=0)
@@ -307,13 +378,13 @@ def train(args=None):
     ctx = (torch.amp.autocast(device_type="cuda", dtype=dtype)
            if device_type == "cuda" else nullcontext())
 
-    print(f"\nStarting DPO — {MAX_STEPS} steps | β={BETA} | "
-          f"{len(train_ds)} pairs (Anthropic HH-RLHF)")
+    print(f"\nStarting on-policy DPO — {MAX_STEPS} steps | β={BETA} | "
+          f"{len(train_ds)} heuristic preference pairs")
     policy.train()
 
     for step in range(MAX_STEPS):
 
-        # ── Eval ──────────────────────────────────────────────────────────────
+        # ── Eval + Preview ────────────────────────────────────────────────────
         if step % EVAL_INTERVAL == 0 or step == MAX_STEPS - 1:
             policy.eval()
             vl, va, n = 0.0, 0.0, 0
@@ -332,12 +403,7 @@ def train(args=None):
             if n:
                 print(f"\nStep {step:5d} | val loss {vl/n:.4f} | "
                       f"pref-accuracy {va/n*100:.1f}%")
-
-            # Generation preview every 200 steps
-            if step % 200 == 0:
-                _preview(raw if torch.cuda.device_count() > 1 else
-                         (policy.module if hasattr(policy, 'module') else policy),
-                         tokenizer, device)
+            _preview(raw, tokenizer, device)
             print()
             policy.train()
 
@@ -383,9 +449,9 @@ def train(args=None):
                 hf_push(lp, hf_repo, hf_token)
 
     print("\n" + "="*60)
-    print("DPO TRAINING COMPLETE! 🎉")
-    print(f"Trained on {len(train_ds)} human preference pairs (HH-RLHF)")
-    print("Same training method as Llama 2, Vicuna, Mistral!")
+    print("ON-POLICY DPO COMPLETE! 🎉")
+    print(f"Trained on {len(train_ds)} heuristic preference pairs")
+    print("Model now prefers higher-quality, less-repetitive responses!")
     print("="*60)
 
 
